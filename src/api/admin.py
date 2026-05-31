@@ -1,5 +1,6 @@
 """Admin API routes"""
 import asyncio
+import importlib
 import json
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
@@ -16,6 +17,14 @@ from curl_cffi.requests import AsyncSession
 from ..core.auth import AuthManager
 from ..core.database import Database
 from ..core.config import config, get_yescaptcha_min_score, normalize_yescaptcha_task_type
+from ..core.models import Token
+from ..core.browser_runtime_status import (
+    fail_runtime_prepare,
+    finish_runtime_prepare,
+    get_runtime_status,
+    progress_runtime_prepare,
+    start_runtime_prepare,
+)
 from ..core.monitoring import build_public_health_snapshot
 from ..services.token_manager import TokenManager
 from ..services.proxy_manager import ProxyManager
@@ -33,6 +42,7 @@ token_manager: TokenManager = None
 proxy_manager: ProxyManager = None
 db: Database = None
 concurrency_manager: Optional[ConcurrencyManager] = None
+captcha_runtime_prepare_tasks: Dict[str, asyncio.Task] = {}
 
 # Store active admin session tokens (in production, use Redis or database)
 active_admin_tokens = set()
@@ -136,6 +146,75 @@ def _guess_client_hints_from_user_agent(user_agent: str) -> Dict[str, str]:
             )
 
     return headers
+
+
+def _validate_browser_proxy_url_local(proxy_url: str) -> tuple[bool, Optional[str]]:
+    if not proxy_url:
+        return True, None
+    normalized = proxy_url.strip()
+    if not re.match(r"^(http|https|socks5h?|socks5)://", normalized):
+        normalized = f"http://{normalized}"
+    if not re.match(r"^(socks5h?|socks5|http|https)://(?:([^:]+):([^@]+)@)?([^:]+):(\d+)$", normalized):
+        return False, "代理格式错误"
+    return True, None
+
+
+def _normalize_runtime_method(method: Optional[str]) -> str:
+    normalized = (method or "").strip().lower()
+    if normalized not in {"browser", "personal"}:
+        raise HTTPException(status_code=400, detail="Invalid runtime method")
+    return normalized
+
+
+async def _prepare_captcha_runtime(method: str):
+    runtime_method = _normalize_runtime_method(method)
+    try:
+        if runtime_method == "browser":
+            start_runtime_prepare(
+                runtime_method,
+                "已开始准备有头浏览器打码运行环境，安装进度将自动显示。",
+            )
+        else:
+            start_runtime_prepare(
+                runtime_method,
+                "已开始准备内置浏览器打码运行环境，安装进度将自动显示。",
+            )
+
+        if runtime_method == "browser":
+            module = await asyncio.to_thread(importlib.import_module, "src.services.browser_captcha")
+            service_cls = getattr(module, "BrowserCaptchaService")
+            service = await service_cls.get_instance(db)
+            if hasattr(service, "reload_browser_count"):
+                await service.reload_browser_count()
+            if hasattr(service, "warmup_browser_slots"):
+                await service.warmup_browser_slots()
+            finish_runtime_prepare(runtime_method, "Chromium 浏览器环境已就绪，可以开始使用有头浏览器打码。")
+            return
+
+        module = await asyncio.to_thread(importlib.import_module, "src.services.browser_captcha_personal")
+        service_cls = getattr(module, "BrowserCaptchaService")
+        service = await service_cls.get_instance(db)
+        await service.reload_config()
+        finish_runtime_prepare(runtime_method, "内置浏览器环境已就绪，可以开始使用 personal 打码。")
+    except HTTPException:
+        raise
+    except Exception as e:
+        fail_runtime_prepare(runtime_method, f"浏览器环境准备失败: {type(e).__name__}: {e}")
+    finally:
+        captcha_runtime_prepare_tasks.pop(runtime_method, None)
+
+
+def _schedule_captcha_runtime_prepare(method: str) -> bool:
+    runtime_method = _normalize_runtime_method(method)
+    task = captcha_runtime_prepare_tasks.get(runtime_method)
+    if task and not task.done():
+        progress_runtime_prepare(runtime_method, "浏览器环境准备任务仍在进行中，请稍候...")
+        return False
+
+    captcha_runtime_prepare_tasks[runtime_method] = asyncio.create_task(
+        _prepare_captcha_runtime(runtime_method)
+    )
+    return True
 
 
 def _guess_impersonate_from_user_agent(user_agent: str) -> str:
@@ -493,6 +572,13 @@ class AddTokenRequest(BaseModel):
     video_enabled: bool = True
     image_concurrency: int = -1
     video_concurrency: int = -1
+    protocol_mode: str = "session"
+    google_cookies: Optional[str] = None
+    login_account: Optional[str] = None
+    login_password: Optional[str] = None
+    proxy_url: Optional[str] = None
+    auto_refresh_enabled: bool = True
+    refresh_interval_minutes: int = 120
 
 
 class UpdateTokenRequest(BaseModel):
@@ -506,6 +592,13 @@ class UpdateTokenRequest(BaseModel):
     video_enabled: Optional[bool] = None
     image_concurrency: Optional[int] = None
     video_concurrency: Optional[int] = None
+    protocol_mode: Optional[str] = None
+    google_cookies: Optional[str] = None
+    login_account: Optional[str] = None
+    login_password: Optional[str] = None
+    proxy_url: Optional[str] = None
+    auto_refresh_enabled: Optional[bool] = None
+    refresh_interval_minutes: Optional[int] = None
 
 
 class ProxyConfigRequest(BaseModel):
@@ -574,11 +667,23 @@ class ImportTokenItem(BaseModel):
     video_enabled: bool = True
     image_concurrency: int = -1
     video_concurrency: int = -1
+    protocol_mode: str = "session"
+    google_cookies: Optional[str] = None
+    login_account: Optional[str] = None
+    login_password: Optional[str] = None
+    proxy_url: Optional[str] = None
+    auto_refresh_enabled: bool = True
+    refresh_interval_minutes: int = 120
 
 
 class ImportTokensRequest(BaseModel):
     """导入Token请求"""
     tokens: List[ImportTokenItem]
+
+
+class TokenRefreshConfigRequest(BaseModel):
+    enabled: Optional[bool] = None
+    refresh_interval_minutes: Optional[int] = None
 
 
 # ========== Auth Middleware ==========
@@ -701,6 +806,15 @@ async def get_tokens(token: str = Depends(verify_admin_token)):
         "current_project_name": row.get("current_project_name"),  # 🆕 项目名称
         "captcha_proxy_url": row.get("captcha_proxy_url") or "",
         "extension_route_key": row.get("extension_route_key") or "",
+        "protocol_mode": row.get("protocol_mode") or "session",
+        "google_cookies": row.get("google_cookies") or "",
+        "login_account": row.get("login_account") or "",
+        "login_password": row.get("login_password") or "",
+        "proxy_url": row.get("proxy_url") or "",
+        "auto_refresh_enabled": bool(row.get("auto_refresh_enabled", True)),
+        "refresh_interval_minutes": row.get("refresh_interval_minutes") or 120,
+        "last_st_refresh_at": to_iso(row.get("last_st_refresh_at")) if row.get("last_st_refresh_at") else None,
+        "last_st_refresh_result": row.get("last_st_refresh_result") or "",
         "image_enabled": bool(row.get("image_enabled")),
         "video_enabled": bool(row.get("video_enabled")),
         "image_concurrency": row.get("image_concurrency"),
@@ -733,7 +847,14 @@ async def add_token(
             image_enabled=request.image_enabled,
             video_enabled=request.video_enabled,
             image_concurrency=request.image_concurrency,
-            video_concurrency=request.video_concurrency
+            video_concurrency=request.video_concurrency,
+            protocol_mode=request.protocol_mode,
+            google_cookies=request.google_cookies,
+            login_account=request.login_account,
+            login_password=request.login_password,
+            proxy_url=request.proxy_url,
+            auto_refresh_enabled=request.auto_refresh_enabled,
+            refresh_interval_minutes=request.refresh_interval_minutes
         )
 
         # 热更新并发限制，避免必须重启服务
@@ -797,7 +918,14 @@ async def update_token(
             image_enabled=request.image_enabled,
             video_enabled=request.video_enabled,
             image_concurrency=request.image_concurrency,
-            video_concurrency=request.video_concurrency
+            video_concurrency=request.video_concurrency,
+            protocol_mode=request.protocol_mode,
+            google_cookies=request.google_cookies,
+            login_account=request.login_account,
+            login_password=request.login_password,
+            proxy_url=request.proxy_url,
+            auto_refresh_enabled=request.auto_refresh_enabled,
+            refresh_interval_minutes=request.refresh_interval_minutes
         )
 
         # 热更新并发限制，确保管理台修改立即生效
@@ -1001,7 +1129,14 @@ async def import_tokens(
                         image_enabled=item.image_enabled,
                         video_enabled=item.video_enabled,
                         image_concurrency=item.image_concurrency,
-                        video_concurrency=item.video_concurrency
+                        video_concurrency=item.video_concurrency,
+                        protocol_mode=item.protocol_mode,
+                        google_cookies=item.google_cookies,
+                        login_account=item.login_account,
+                        login_password=item.login_password,
+                        proxy_url=item.proxy_url,
+                        auto_refresh_enabled=item.auto_refresh_enabled,
+                        refresh_interval_minutes=item.refresh_interval_minutes
                     )
                     # 如果过期则禁用
                     if is_expired:
@@ -1016,6 +1151,13 @@ async def import_tokens(
                     existing.video_enabled = item.video_enabled
                     existing.image_concurrency = item.image_concurrency
                     existing.video_concurrency = item.video_concurrency
+                    existing.protocol_mode = item.protocol_mode
+                    existing.google_cookies = item.google_cookies or ""
+                    existing.login_account = item.login_account or ""
+                    existing.login_password = item.login_password or ""
+                    existing.proxy_url = item.proxy_url or ""
+                    existing.auto_refresh_enabled = item.auto_refresh_enabled
+                    existing.refresh_interval_minutes = item.refresh_interval_minutes
                     updated += 1
                 else:
                     # 添加新Token
@@ -1026,7 +1168,14 @@ async def import_tokens(
                         image_enabled=item.image_enabled,
                         video_enabled=item.video_enabled,
                         image_concurrency=item.image_concurrency,
-                        video_concurrency=item.video_concurrency
+                        video_concurrency=item.video_concurrency,
+                        protocol_mode=item.protocol_mode,
+                        google_cookies=item.google_cookies,
+                        login_account=item.login_account,
+                        login_password=item.login_password,
+                        proxy_url=item.proxy_url,
+                        auto_refresh_enabled=item.auto_refresh_enabled,
+                        refresh_interval_minutes=item.refresh_interval_minutes
                     )
                     # 如果过期则禁用
                     if is_expired:
@@ -1463,23 +1612,49 @@ async def update_generation_timeout(
 
 @router.get("/api/token-refresh/config")
 async def get_token_refresh_config(token: str = Depends(verify_admin_token)):
-    """Get AT auto refresh configuration (默认启用)"""
+    """Get AT/protocol refresh configuration."""
+    refresh_config = await db.get_token_refresh_config()
     return {
         "success": True,
         "config": {
-            "at_auto_refresh_enabled": True  # Flow2API默认启用AT自动刷新
+            "at_auto_refresh_enabled": True,
+            "protocol_refresh_enabled": refresh_config.enabled,
+            "refresh_interval_minutes": refresh_config.refresh_interval_minutes,
         }
     }
 
 
 @router.post("/api/token-refresh/enabled")
 async def update_token_refresh_enabled(
+    request: Optional[dict] = None,
     token: str = Depends(verify_admin_token)
 ):
-    """Update AT auto refresh enabled (Flow2API固定启用,此接口仅用于前端兼容)"""
+    """Update protocol ST refresh enabled; AT refresh remains always enabled."""
+    enabled = (request or {}).get("enabled")
+    if enabled is not None:
+        await db.update_token_refresh_config(enabled=bool(enabled))
     return {
         "success": True,
-        "message": "Flow2API的AT自动刷新默认启用且无法关闭"
+        "message": "刷新配置已更新"
+    }
+
+
+@router.post("/api/token-refresh/config")
+async def update_token_refresh_config(
+    request: TokenRefreshConfigRequest,
+    token: str = Depends(verify_admin_token)
+):
+    refresh_config = await db.update_token_refresh_config(
+        enabled=request.enabled,
+        refresh_interval_minutes=request.refresh_interval_minutes,
+    )
+    return {
+        "success": True,
+        "config": {
+            "at_auto_refresh_enabled": True,
+            "protocol_refresh_enabled": refresh_config.enabled,
+            "refresh_interval_minutes": refresh_config.refresh_interval_minutes,
+        }
     }
 
 
@@ -1576,8 +1751,6 @@ async def update_captcha_config(
     token: str = Depends(verify_admin_token)
 ):
     """Update captcha configuration"""
-    from ..services.browser_captcha import validate_browser_proxy_url
-
     captcha_method = request.get("captcha_method")
     yescaptcha_api_key = request.get("yescaptcha_api_key")
     yescaptcha_base_url = request.get("yescaptcha_base_url")
@@ -1604,7 +1777,7 @@ async def update_captcha_config(
 
     # 验证浏览器代理URL格式
     if browser_proxy_enabled and browser_proxy_url:
-        is_valid, error_msg = validate_browser_proxy_url(browser_proxy_url)
+        is_valid, error_msg = _validate_browser_proxy_url_local(browser_proxy_url)
         if not is_valid:
             return {"success": False, "message": error_msg}
 
@@ -1662,25 +1835,43 @@ async def update_captcha_config(
     # 🔥 Hot reload: sync database config to memory
     await db.reload_config_to_memory()
 
-    # 如果使用 browser 打码，热重载浏览器数量配置
-    if captcha_method == "browser":
-        try:
-            from ..services.browser_captcha import BrowserCaptchaService
-            service = await BrowserCaptchaService.get_instance(db)
-            await service.reload_browser_count()
-        except Exception:
-            pass
+    runtime_prepare_started = False
+    runtime_prepare_message = ""
+    runtime_status_method = None
 
-    # 如果使用 personal 打码，热重载配置
-    if captcha_method == "personal":
-        try:
-            from ..services.browser_captcha_personal import BrowserCaptchaService
-            service = await BrowserCaptchaService.get_instance(db)
-            await service.reload_config()
-        except Exception as e:
-            print(f"[Admin] Personal 配置热更新失败: {e}")
+    if captcha_method in {"browser", "personal"}:
+        runtime_status_method = captcha_method
+        runtime_prepare_started = _schedule_captcha_runtime_prepare(captcha_method)
+        if captcha_method == "browser":
+            runtime_prepare_message = (
+                "已开始准备有头浏览器打码运行环境，安装进度将自动显示。"
+            )
+        else:
+            runtime_prepare_message = (
+                "已开始准备内置浏览器打码运行环境，安装进度将自动显示。"
+            )
 
-    return {"success": True, "message": "验证码配置更新成功"}
+    return {
+        "success": True,
+        "message": "验证码配置更新成功",
+        "runtime_prepare_started": runtime_prepare_started,
+        "runtime_prepare_message": runtime_prepare_message,
+        "runtime_status_method": runtime_status_method,
+    }
+
+
+@router.get("/api/captcha/runtime-status")
+async def get_captcha_runtime_status(
+    method: str = "browser",
+    token: str = Depends(verify_admin_token)
+):
+    """Get background browser runtime preparation status."""
+    runtime_method = _normalize_runtime_method(method)
+    task = captcha_runtime_prepare_tasks.get(runtime_method)
+    status = get_runtime_status(runtime_method)
+    status["method"] = runtime_method
+    status["task_running"] = bool(task and not task.done())
+    return status
 
 
 @router.get("/api/captcha/config")
@@ -2050,6 +2241,18 @@ async def test_captcha_score(
 
 # ========== Plugin Configuration Endpoints ==========
 
+async def _verify_plugin_connection_token(authorization: Optional[str]) -> None:
+    plugin_config = await db.get_plugin_config()
+    provided_token = None
+    if authorization:
+        if authorization.startswith("Bearer "):
+            provided_token = authorization[7:]
+        else:
+            provided_token = authorization
+    if not plugin_config.connection_token or provided_token != plugin_config.connection_token:
+        raise HTTPException(status_code=401, detail="Invalid connection token")
+
+
 @router.get("/api/plugin/config")
 async def get_plugin_config(request: Request, token: str = Depends(verify_admin_token)):
     """Get plugin configuration"""
@@ -2113,20 +2316,8 @@ async def update_plugin_config(
 @router.post("/api/plugin/update-token")
 async def plugin_update_token(request: dict, authorization: Optional[str] = Header(None)):
     """Receive token update from Chrome extension (no admin auth required, uses connection_token)"""
-    # Verify connection token
+    await _verify_plugin_connection_token(authorization)
     plugin_config = await db.get_plugin_config()
-
-    # Extract token from Authorization header
-    provided_token = None
-    if authorization:
-        if authorization.startswith("Bearer "):
-            provided_token = authorization[7:]
-        else:
-            provided_token = authorization
-
-    # Check if token matches
-    if not plugin_config.connection_token or provided_token != plugin_config.connection_token:
-        raise HTTPException(status_code=401, detail="Invalid connection token")
 
     # Extract session token from request
     session_token = request.get("session_token")
@@ -2168,7 +2359,14 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
                 token_id=existing_token.id,
                 st=session_token,
                 at=at,
-                at_expires=at_expires
+                at_expires=at_expires,
+                protocol_mode=request.get("protocol_mode"),
+                google_cookies=request.get("google_cookies"),
+                login_account=request.get("login_account"),
+                login_password=request.get("login_password"),
+                proxy_url=request.get("proxy_url"),
+                auto_refresh_enabled=request.get("auto_refresh_enabled"),
+                refresh_interval_minutes=request.get("refresh_interval_minutes"),
             )
 
             # Check if auto-enable is enabled and token is disabled
@@ -2193,7 +2391,14 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
         try:
             new_token = await token_manager.add_token(
                 st=session_token,
-                remark="Added by Chrome Extension"
+                remark="Added by Chrome Extension",
+                protocol_mode=request.get("protocol_mode", "session"),
+                google_cookies=request.get("google_cookies"),
+                login_account=request.get("login_account"),
+                login_password=request.get("login_password"),
+                proxy_url=request.get("proxy_url"),
+                auto_refresh_enabled=request.get("auto_refresh_enabled", True),
+                refresh_interval_minutes=request.get("refresh_interval_minutes", 120),
             )
 
             return {
@@ -2204,3 +2409,52 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
             }
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to add token: {str(e)}")
+
+
+@router.post("/api/plugin/check-tokens")
+async def plugin_check_tokens(request: Optional[dict] = None, authorization: Optional[str] = Header(None)):
+    """Return token status for external syncers using the plugin connection token."""
+    await _verify_plugin_connection_token(authorization)
+
+    request = request or {}
+    requested_emails = request.get("emails") if isinstance(request, dict) else None
+    email_filter = set()
+    if isinstance(requested_emails, list):
+        email_filter = {
+            str(email or "").strip().lower()
+            for email in requested_emails
+            if str(email or "").strip()
+        }
+
+    rows = await db.get_all_tokens_with_stats()
+    tokens = []
+    for row in rows:
+        email = str(row.get("email") or "").strip()
+        if email_filter and email.lower() not in email_filter:
+            continue
+        token_obj = None
+        try:
+            token_obj = Token(**row)
+        except Exception:
+            token_obj = None
+        needs_refresh = token_manager.needs_at_refresh(token_obj) if token_obj else True
+        tokens.append({
+            "id": row.get("id"),
+            "email": email,
+            "is_active": bool(row.get("is_active")),
+            "needs_refresh": needs_refresh,
+            "at_expires": row.get("at_expires").isoformat() if hasattr(row.get("at_expires"), "isoformat") else row.get("at_expires"),
+            "last_used_at": row.get("last_used_at").isoformat() if hasattr(row.get("last_used_at"), "isoformat") else row.get("last_used_at"),
+            "protocol_mode": row.get("protocol_mode") or "session",
+            "auto_refresh_enabled": bool(row.get("auto_refresh_enabled", True)),
+            "refresh_interval_minutes": row.get("refresh_interval_minutes") or 120,
+            "last_st_refresh_at": (
+                row.get("last_st_refresh_at").isoformat()
+                if hasattr(row.get("last_st_refresh_at"), "isoformat")
+                else row.get("last_st_refresh_at")
+            ),
+            "last_st_refresh_result": row.get("last_st_refresh_result") or "",
+            "credits": row.get("credits", 0),
+        })
+
+    return {"success": True, "tokens": tokens}

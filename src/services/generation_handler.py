@@ -221,7 +221,8 @@ MODEL_CONFIG = {
         "video_type": "t2v",
         "model_key": "veo_3_1_t2v_fast_portrait",
         "aspect_ratio": "VIDEO_ASPECT_RATIO_PORTRAIT",
-        "supports_images": False
+        "supports_images": False,
+        "use_v2_model_config": True,
     },
     # veo_3_1_t2v_fast_landscape (横屏)
     # 上游模型名: veo_3_1_t2v_fast
@@ -230,7 +231,8 @@ MODEL_CONFIG = {
         "video_type": "t2v",
         "model_key": "veo_3_1_t2v_fast",
         "aspect_ratio": "VIDEO_ASPECT_RATIO_LANDSCAPE",
-        "supports_images": False
+        "supports_images": False,
+        "use_v2_model_config": True,
     },
 
     # veo_3_1_t2v_fast_ultra (横竖屏)
@@ -239,14 +241,16 @@ MODEL_CONFIG = {
         "video_type": "t2v",
         "model_key": "veo_3_1_t2v_fast_portrait_ultra",
         "aspect_ratio": "VIDEO_ASPECT_RATIO_PORTRAIT",
-        "supports_images": False
+        "supports_images": False,
+        "use_v2_model_config": True,
     },
     "veo_3_1_t2v_fast_ultra": {
         "type": "video",
         "video_type": "t2v",
         "model_key": "veo_3_1_t2v_fast_ultra",
         "aspect_ratio": "VIDEO_ASPECT_RATIO_LANDSCAPE",
-        "supports_images": False
+        "supports_images": False,
+        "use_v2_model_config": True,
     },
 
     # veo_3_1_t2v_fast_ultra_relaxed (横竖屏)
@@ -255,14 +259,16 @@ MODEL_CONFIG = {
         "video_type": "t2v",
         "model_key": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
         "aspect_ratio": "VIDEO_ASPECT_RATIO_PORTRAIT",
-        "supports_images": False
+        "supports_images": False,
+        "use_v2_model_config": True,
     },
     "veo_3_1_t2v_fast_ultra_relaxed": {
         "type": "video",
         "video_type": "t2v",
         "model_key": "veo_3_1_t2v_fast_ultra_relaxed",
         "aspect_ratio": "VIDEO_ASPECT_RATIO_LANDSCAPE",
-        "supports_images": False
+        "supports_images": False,
+        "use_v2_model_config": True,
     },
 
     # veo_3_1_t2v (横竖屏)
@@ -271,14 +277,16 @@ MODEL_CONFIG = {
         "video_type": "t2v",
         "model_key": "veo_3_1_t2v_fast_portrait",
         "aspect_ratio": "VIDEO_ASPECT_RATIO_PORTRAIT",
-        "supports_images": False
+        "supports_images": False,
+        "use_v2_model_config": True,
     },
     "veo_3_1_t2v_landscape": {
         "type": "video",
         "video_type": "t2v",
         "model_key": "veo_3_1_t2v_fast",
         "aspect_ratio": "VIDEO_ASPECT_RATIO_LANDSCAPE",
-        "supports_images": False
+        "supports_images": False,
+        "use_v2_model_config": True,
     },
     # veo_3_1_t2v_lite (横竖屏，来自 labs.google.har)
     "veo_3_1_t2v_lite_portrait": {
@@ -672,6 +680,38 @@ MODEL_CONFIG = {
         "supports_images": False,
         "requires_video_id": True,
     },
+    # ========== Gemini Omni Flash ==========
+    # 2026-05-26 实测上游真实请求：
+    # - 纯文本 -> video:batchAsyncGenerateVideoText, videoModelKey=abra_t2v_8s
+    # - 参考图 -> video:batchAsyncGenerateVideoReferenceImages, videoModelKey=abra_r2v_8s
+    "omni": {
+        "type": "video",
+        "video_type": "omni",
+        "model_key": "abra_t2v_8s",
+        "aspect_ratio": "VIDEO_ASPECT_RATIO_LANDSCAPE",
+        "supports_images": True,
+        "min_images": 0,
+        "max_images": 3,
+        "use_v2_model_config": True,
+        "allow_tier_upgrade": False,
+        "reference_model_key": "abra_r2v_8s",
+        "reference_duration": 8,
+        "reference_model_display_name": "Omni Flash",
+    },
+    "omni_portrait": {
+        "type": "video",
+        "video_type": "omni",
+        "model_key": "abra_t2v_8s",
+        "aspect_ratio": "VIDEO_ASPECT_RATIO_PORTRAIT",
+        "supports_images": True,
+        "min_images": 0,
+        "max_images": 3,
+        "use_v2_model_config": True,
+        "allow_tier_upgrade": False,
+        "reference_model_key": "abra_r2v_8s",
+        "reference_duration": 8,
+        "reference_model_display_name": "Omni Flash",
+    },
 }
 
 
@@ -962,6 +1002,49 @@ class GenerationHandler:
             generation_result["error_message"] = None
             generation_result["error_emitted"] = False
 
+    async def _resolve_video_asset(
+        self,
+        token,
+        operation: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """按当前上游逻辑解析视频资产：状态由 media 决定，URL 通过 redirect 二段获取。"""
+        metadata = (operation.get("operation") or {}).get("metadata", {}) or {}
+        video_info = metadata.get("video", {}) if isinstance(metadata.get("video"), dict) else {}
+        media_name = (
+            operation.get("mediaName")
+            or video_info.get("mediaName")
+            or video_info.get("mediaGenerationId")
+            or operation.get("name")
+            or (operation.get("operation") or {}).get("name")
+        )
+
+        video_url = ""
+        if media_name and getattr(token, "st", None):
+            video_url = await self.flow_client.get_media_url_redirect(
+                token.st,
+                media_name,
+                media_url_type="MEDIA_URL_TYPE_FULL_MEDIA",
+            ) or ""
+
+        import re as _re
+        uuid_match = _re.search(r"/video/([0-9a-f-]{36})", video_url or "")
+        video_media_id = (
+            uuid_match.group(1)
+            if uuid_match
+            else str(media_name or video_info.get("mediaGenerationId") or "")
+        )
+
+        return {
+            "media_name": media_name,
+            "video_url": video_url,
+            "video_media_id": video_media_id,
+            "aspect_ratio": video_info.get("aspectRatio", "VIDEO_ASPECT_RATIO_LANDSCAPE"),
+            "model": video_info.get("model"),
+            "duration": video_info.get("duration"),
+            "metadata": metadata,
+            "video_info": video_info,
+        }
+
     def _normalize_error_message(self, error_message: Any, max_length: int = 1000) -> str:
         """归一化错误文本，避免写入超长内容。"""
         text = str(error_message or "").strip() or "未知错误"
@@ -1142,7 +1225,7 @@ class GenerationHandler:
                 progress=request_log_state.get("progress", 0),
             )
             if stream:
-                yield self._create_stream_chunk(f"❌ {error_msg}\n")
+                yield self._create_stream_chunk(f"错误: {error_msg}\n")
             yield self._create_error_response(error_msg, status_code=503)
             return
 
@@ -1176,7 +1259,7 @@ class GenerationHandler:
                 debug_logger.log_error(f"[GENERATION] {error_msg}")
                 record_generation_result(generation_type, "failed", time.time() - start_time)
                 if stream:
-                    yield self._create_stream_chunk(f"❌ {error_msg}\n")
+                    yield self._create_stream_chunk(f"错误: {error_msg}\n")
                 yield self._create_error_response(error_msg, status_code=503)
                 return
 
@@ -1189,7 +1272,7 @@ class GenerationHandler:
                 debug_logger.log_error(f"[GENERATION] {error_msg}")
                 record_generation_result(generation_type, "failed", time.time() - start_time)
                 if stream:
-                    yield self._create_stream_chunk(f"❌ {error_msg}\n")
+                    yield self._create_stream_chunk(f"错误: {error_msg}\n")
                 yield self._create_error_response(error_msg, status_code=403)
                 return
 
@@ -1263,7 +1346,7 @@ class GenerationHandler:
                 )
                 if not generation_result.get("error_emitted"):
                     if stream:
-                        yield self._create_stream_chunk(f"❌ {error_msg}\n")
+                        yield self._create_stream_chunk(f"错误: {error_msg}\n")
                     yield self._create_error_response(error_msg, status_code=500)
                 return
 
@@ -1345,7 +1428,7 @@ class GenerationHandler:
             raise
         except Exception as e:
             error_msg = f"生成失败: {str(e)}"
-            debug_logger.log_error(f"[GENERATION] ❌ {error_msg}")
+            debug_logger.log_error(f"[GENERATION] 生成失败: {error_msg}")
             if token:
                 # 记录错误（所有错误统一处理，不再特殊处理429）
                 await self.token_manager.record_error(token.id)
@@ -1369,7 +1452,7 @@ class GenerationHandler:
                 progress=request_log_state.get("progress", 0),
             )
             if stream:
-                yield self._create_stream_chunk(f"❌ {error_msg}\n")
+                yield self._create_stream_chunk(f"错误: {error_msg}\n")
             yield self._create_error_response(error_msg, status_code=500)
         finally:
             if pending_token_state.get("active") and token and self.load_balancer:
@@ -1742,10 +1825,20 @@ class GenerationHandler:
                 images = None  # 清空图片
                 image_count = 0
 
+            # Omni: 无图走 T2V，有图走当前上游 Reference Images 直连链路
+            elif video_type == "omni":
+                if max_images is not None and image_count > max_images:
+                    error_msg = f"Omni 模型最多支持 {max_images} 张参考图，当前提供了 {image_count} 张"
+                    if stream:
+                        yield self._create_stream_chunk(f"{error_msg}\n")
+                    self._mark_generation_failed(generation_result, error_msg)
+                    yield self._create_error_response(error_msg, status_code=400)
+                    return
+
             # I2V: 首尾帧模型 - 需要1-2张图片
             elif video_type == "i2v":
                 if image_count < min_images or image_count > max_images:
-                    error_msg = f"❌ 首尾帧模型需要 {min_images}-{max_images} 张图片,当前提供了 {image_count} 张"
+                    error_msg = f"首尾帧模型需要 {min_images}-{max_images} 张图片，当前提供了 {image_count} 张"
                     if stream:
                         yield self._create_stream_chunk(f"{error_msg}\n")
                     self._mark_generation_failed(generation_result, error_msg)
@@ -1755,7 +1848,7 @@ class GenerationHandler:
             # R2V: 多图生成 - 当前上游协议最多 3 张参考图
             elif video_type == "r2v":
                 if max_images is not None and image_count > max_images:
-                    error_msg = f"❌ 多图视频模型最多支持 {max_images} 张参考图,当前提供了 {image_count} 张"
+                    error_msg = f"多图视频模型最多支持 {max_images} 张参考图，当前提供了 {image_count} 张"
                     if stream:
                         yield self._create_stream_chunk(f"{error_msg}\n")
                     self._mark_generation_failed(generation_result, error_msg)
@@ -1804,6 +1897,21 @@ class GenerationHandler:
                         "mediaId": media_id
                     })
                 debug_logger.log_info(f"[R2V] 上传了 {len(reference_images)} 张参考图片")
+
+            # Omni R2V: 参考图上传到 project，随后直接走 batchAsyncGenerateVideoReferenceImages
+            elif video_type == "omni" and images:
+                if stream:
+                    yield self._create_stream_chunk(f"上传 {image_count} 张 Omni 参考图片...\n")
+
+                for img in images:
+                    media_id = await self.flow_client.upload_image(
+                        token.at, img, model_config["aspect_ratio"], project_id=project_id
+                    )
+                    reference_images.append({
+                        "imageUsageType": "IMAGE_USAGE_TYPE_ASSET",
+                        "mediaId": media_id
+                    })
+                debug_logger.log_info(f"[VIDEO OMNI-R2V] 上传了 {len(reference_images)} 张参考图片")
 
             # ========== 调用生成API ==========
             if stream:
@@ -1862,10 +1970,26 @@ class GenerationHandler:
                     token_video_concurrency=token.video_concurrency,
                 )
 
+            # Omni: 有图走 Reference Images 直连链路，无图走纯文本链路
+            elif video_type == "omni" and reference_images:
+                if stream:
+                    yield self._create_stream_chunk("提交 Omni 参考图视频任务...\n")
+                result = await self.flow_client.generate_video_reference_images(
+                    at=token.at,
+                    project_id=project_id,
+                    prompt=prompt,
+                    model_key=model_config.get("reference_model_key", "abra_r2v_8s"),
+                    aspect_ratio=model_config["aspect_ratio"],
+                    reference_images=reference_images,
+                    user_paygate_tier=normalized_tier,
+                    token_id=token.id,
+                    token_video_concurrency=token.video_concurrency,
+                )
+
             # Extend: 视频续写
             elif video_type == "extend":
                 if not video_media_id:
-                    error_msg = "❌ 视频续写需要提供源视频的 mediaGenerationId，请在 image_url 中传入 extend://VIDEO_MEDIA_ID"
+                    error_msg = "视频续写需要提供源视频的 mediaGenerationId，请在 image_url 中传入 extend://VIDEO_MEDIA_ID"
                     if stream:
                         yield self._create_stream_chunk(f"{error_msg}\n")
                     self._mark_generation_failed(generation_result, error_msg)
@@ -2013,24 +2137,42 @@ class GenerationHandler:
 
                 # 检查状态
                 if status == "MEDIA_GENERATION_STATUS_SUCCESSFUL":
-                    # 成功
-                    metadata = operation["operation"].get("metadata", {})
-                    video_info = metadata.get("video", {})
-                    video_url = video_info.get("fifeUrl")
-                    # Extract short UUID from Google Storage URL (e.g., /video/UUID?)
-                    # Both extend API and concat API need this short UUID format,
-                    # NOT the CAUS base64 mediaGenerationId from video_info
-                    import re as _re
-                    _uuid_match = _re.search(r'/video/([0-9a-f-]{36})', video_url or '')
-                    video_media_id = _uuid_match.group(1) if _uuid_match else video_info.get("mediaGenerationId", "")
-                    aspect_ratio = video_info.get("aspectRatio", "VIDEO_ASPECT_RATIO_LANDSCAPE")
-
-                    if not video_url:
-                        error_msg = "视频生成失败: 视频URL为空"
+                    try:
+                        resolved_video = await self._resolve_video_asset(token, operation)
+                    except Exception as redirect_error:
+                        media_name = (
+                            operation.get("mediaName")
+                            or operation.get("name")
+                            or operation["operation"].get("name")
+                        )
+                        error_msg = f"视频生成成功但获取媒体地址失败: {self._normalize_error_message(redirect_error)}"
+                        debug_logger.log_warning(
+                            f"[VIDEO POLL] 获取视频URL失败: media={media_name}, error={redirect_error}"
+                        )
                         await self._fail_video_task(checked_operations, error_msg)
                         self._mark_generation_failed(generation_result, error_msg)
                         yield self._create_error_response(error_msg, status_code=502)
                         return
+
+                    video_url = resolved_video["video_url"]
+                    video_media_id = resolved_video["video_media_id"]
+                    aspect_ratio = resolved_video["aspect_ratio"]
+                    media_name = resolved_video["media_name"]
+                    metadata = resolved_video["metadata"]
+                    video_info = resolved_video["video_info"]
+
+                    if not video_url:
+                        error_msg = "视频生成成功但未获取到媒体地址"
+                        await self._fail_video_task(checked_operations, error_msg)
+                        self._mark_generation_failed(generation_result, error_msg)
+                        yield self._create_error_response(error_msg, status_code=502)
+                        return
+
+                    video_info["url"] = video_url
+                    video_info["mediaName"] = media_name
+                    video_info["mediaGenerationId"] = video_media_id
+                    metadata.setdefault("video", video_info)
+                    operation["operation"]["metadata"] = metadata
 
                     # ========== 视频放大处理 ==========
                     if upsample_config and video_media_id:
@@ -2047,6 +2189,7 @@ class GenerationHandler:
                                 aspect_ratio=aspect_ratio,
                                 resolution=upsample_config["resolution"],
                                 model_key=upsample_config["model_key"],
+                                user_paygate_tier=normalized_tier,
                                 token_id=token.id,
                                 token_video_concurrency=token.video_concurrency,
                             )
@@ -2171,6 +2314,10 @@ class GenerationHandler:
                         "type": "video",
                         "final_video_url": local_url,
                         "mediaGenerationId": video_media_id,
+                        "mediaName": media_name,
+                        "aspectRatio": aspect_ratio,
+                        "model": resolved_video.get("model"),
+                        "duration": resolved_video.get("duration"),
                     }
 
                     # 返回结果
@@ -2205,7 +2352,7 @@ class GenerationHandler:
                     friendly_error = f"视频生成失败: {error_message}，请重试"
                     self._mark_generation_failed(generation_result, friendly_error)
                     if stream:
-                        yield self._create_stream_chunk(f"❌ {friendly_error}\n")
+                        yield self._create_stream_chunk(f"错误: {friendly_error}\n")
                     yield self._create_error_response(friendly_error, status_code=502)
                     return
 
@@ -2223,7 +2370,7 @@ class GenerationHandler:
                     await self._fail_video_task(checked_operations, error_msg)
                     self._mark_generation_failed(generation_result, error_msg)
                     if stream:
-                        yield self._create_stream_chunk(f"❌ {error_msg}\n")
+                        yield self._create_stream_chunk(f"错误: {error_msg}\n")
                     yield self._create_error_response(error_msg, status_code=504)
                     return
 
@@ -2236,7 +2383,7 @@ class GenerationHandler:
                     await self._fail_video_task(operations, error_msg)
                     self._mark_generation_failed(generation_result, error_msg)
                     if stream:
-                        yield self._create_stream_chunk(f"❌ {error_msg}\n")
+                        yield self._create_stream_chunk(f"错误: {error_msg}\n")
                     yield self._create_error_response(error_msg, status_code=502)
                     return
                 continue

@@ -66,6 +66,32 @@ PERSONAL_GOOGLE_FAMILY_COOKIE_MIRROR_URLS = (
     "https://www.google.com/",
     "https://www.recaptcha.net/",
 )
+# Session cookie cache for computed captcha relay
+# Personal browser writes Google session cookies here after each successful solve.
+_recaptcha_session_cookies: Optional[Dict[str, str]] = None
+_recaptcha_session_cookies_fetched_at: float = 0.0
+_RECAPTCHA_SESSION_COOKIES_TTL: float = 3600.0  # 1h 缓存周期，避免频繁导航打断 resident tab
+
+
+def get_cached_session_cookies() -> Optional[Dict[str, str]]:
+    """读取缓存的 Google session cookies。"""
+    global _recaptcha_session_cookies, _recaptcha_session_cookies_fetched_at
+    if not _recaptcha_session_cookies:
+        return None
+    if time.time() - _recaptcha_session_cookies_fetched_at > _RECAPTCHA_SESSION_COOKIES_TTL:
+        return None
+    return dict(_recaptcha_session_cookies)
+
+
+def set_cached_session_cookies(cookies: Dict[str, str]):
+    """写入 session cookie 缓存。"""
+    global _recaptcha_session_cookies, _recaptcha_session_cookies_fetched_at
+    _recaptcha_session_cookies = dict(cookies)
+    _recaptcha_session_cookies_fetched_at = time.time()
+    if cookies:
+        debug_logger.log_info("[BrowserCaptcha] session cookie 缓存已更新: %d cookies", len(cookies))
+
+
 PERSONAL_HEADLESS_VISIBLE_SPOOF_SOURCE = r"""
 (() => {
     const marker = "__personalHeadlessVisibleSpoofInstalled__";
@@ -105,18 +131,6 @@ PERSONAL_HEADLESS_VISIBLE_SPOOF_SOURCE = r"""
             window.focus();
         }
     } catch (e) {}
-
-    const emit = (target, type) => {
-        try {
-            target.dispatchEvent(new Event(type));
-        } catch (e) {}
-    };
-
-    setTimeout(() => {
-        emit(document, "visibilitychange");
-        emit(window, "focus");
-        emit(window, "pageshow");
-    }, 0);
 })();
 """
 PERSONAL_FINGERPRINT_SURFACE_SPOOF_MARKER = "__personalFingerprintSurfaceSpoofInstalled__"
@@ -847,15 +861,49 @@ def _patch_nodriver_connection_instance(connection_instance):
         debug_logger.log_warning(f"[BrowserCaptcha] 加载 nodriver.connection 失败，跳过连接补丁: {e}")
         return
 
+    class _CompatTransaction:
+        def __init__(self, cdp_generator, tx_id: int):
+            method, *params = next(cdp_generator).values()
+            params = params.pop() if params else {}
+            self.id = tx_id
+            self.message = json.dumps({"method": method, "params": params, "id": tx_id})
+            self._cdp_generator = cdp_generator
+            self._future = asyncio.get_running_loop().create_future()
+
+        def __call__(self, **response):
+            if self._future.done():
+                return
+            if "error" in response:
+                self._future.set_exception(RuntimeError(str(response["error"])))
+                return
+            try:
+                self._cdp_generator.send(response.get("result"))
+            except StopIteration as e:
+                self._future.set_result(e.value)
+            except Exception as e:
+                self._future.set_exception(e)
+
+        def __await__(self):
+            return self._future.__await__()
+
+        def done(self) -> bool:
+            return self._future.done()
+
+        def cancel(self):
+            self._future.cancel()
+
     async def patched_send(self, cdp_obj, _is_update=False):
         if _is_nodriver_connection_closed(self):
             await self.connect()
         if not _is_update:
             await self._register_handlers()
 
-        transaction = nodriver_connection_module.Transaction(cdp_obj)
         tx_id = next(self.__count__)
-        transaction.id = tx_id
+        try:
+            transaction = nodriver_connection_module.Transaction(cdp_obj)
+            transaction.id = tx_id
+        except Exception:
+            transaction = _CompatTransaction(cdp_obj, tx_id)
         self.mapper[tx_id] = transaction
 
         websocket = getattr(self, "websocket", None)
@@ -1402,7 +1450,7 @@ class BrowserCaptchaService:
         max_resident_tabs_override: Optional[int] = None,
     ):
         """初始化服务"""
-        self.headless = bool(getattr(config, "personal_headless", False))  # 是否无头由配置控制
+        self.headless = True  # 强制无头模式
         self.browser = None
         self._initialized = False
         self.website_key = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
@@ -2574,7 +2622,7 @@ class BrowserCaptchaService:
             from nodriver import cdp
 
             await self._run_with_timeout(
-                self.browser.connection.send(cdp.browser.get_version()),
+                self.browser.send(cdp.browser.get_version()),
                 timeout_seconds=3.0,
                 label="browser.health_probe",
             )
@@ -2713,7 +2761,7 @@ class BrowserCaptchaService:
             from nodriver import cdp
 
             version_info = await self._run_with_timeout(
-                self.browser.connection.send(cdp.browser.get_version()),
+                self.browser.send(cdp.browser.get_version()),
                 timeout_seconds=5.0,
                 label="browser.get_version:runtime_profile",
             )
@@ -2898,7 +2946,7 @@ class BrowserCaptchaService:
                 for permission_name, permission_setting in configured_permissions:
                     try:
                         await self._run_with_timeout(
-                            self.browser.connection.send(
+                            self.browser.send(
                                 cdp.browser.set_permission(
                                     permission=cdp.browser.PermissionDescriptor(name=permission_name),
                                     setting=permission_setting,
@@ -2916,7 +2964,7 @@ class BrowserCaptchaService:
                         ):
                             raise
                         await self._run_with_timeout(
-                            self.browser.connection.send(
+                            self.browser.send(
                                 cdp.browser.set_permission(
                                     permission=cdp.browser.PermissionDescriptor(name=permission_name),
                                     setting=permission_setting,
@@ -3507,9 +3555,15 @@ class BrowserCaptchaService:
         def signed_unit(index: int, scale: float) -> float:
             return round((((digest[index] / 255.0) * 2.0) - 1.0) * scale, 8)
 
+        runtime_profile = dict(self._runtime_surface_profile or {})
+        window_profile = runtime_profile.get("window") or {}
+        cap_viewport_w = window_profile.get("innerWidth", 1280)
+        cap_viewport_h = window_profile.get("innerHeight", 720)
+        is_landscape = cap_viewport_w >= cap_viewport_h
+
         return {
             "seed": hashlib.md5(seed_material).hexdigest()[:16],
-            "runtime": dict(self._runtime_surface_profile or {}),
+            "runtime": runtime_profile,
             "canvas": {
                 "rgba": [
                     non_zero_byte_delta(0),
@@ -3529,6 +3583,18 @@ class BrowserCaptchaService:
                 "floatDelta": signed_unit(8, 0.00003),
                 "byteDelta": non_zero_byte_delta(9),
                 "stride": 17 + (digest[10] % 13),
+            },
+            "capability": {
+                "bluetoothAvailable": bool(digest[11] < 51),
+                "usbDeviceCount": digest[12] % 4,
+                "serialPortCount": digest[13] % 3,
+                "hidDeviceCount": digest[14] % 4,
+                "mediaCodecSmooth": bool(digest[15] < 230),
+                "speechVoiceCount": 2 + (digest[16] % 4),
+                "screenX": (digest[17] % 17) - 8,
+                "screenY": (digest[18] % 17) - 8,
+                "orientationType": "landscape-primary" if is_landscape else "portrait-primary",
+                "orientationAngle": 0 if is_landscape else 90,
             },
         }
 
@@ -3836,6 +3902,29 @@ class BrowserCaptchaService:
     patchScreenMetric("colorDepth");
     patchScreenMetric("pixelDepth");
 
+    if (window.screen && typeof window.screen.orientation === "object" && !window.screen.orientation.type) {
+        const capOrientation = config.capability || {};
+        const orientation = {
+            type: String(capOrientation.orientationType || "landscape-primary"),
+            angle: Number(capOrientation.orientationAngle || 0),
+            onchange: null,
+            addEventListener: () => {},
+            removeEventListener: () => {},
+            dispatchEvent: () => true,
+            lock: async () => undefined,
+            unlock: () => undefined,
+        };
+        try {
+            if (window.ScreenOrientation && window.ScreenOrientation.prototype) {
+                Object.setPrototypeOf(orientation, window.ScreenOrientation.prototype);
+            }
+        } catch (e) {}
+        defineGetter(Screen.prototype, "orientation", () => orientation);
+        if (window.screen) {
+            defineGetter(window.screen, "orientation", () => orientation);
+        }
+    }
+
     const patchWindowMetric = (key) => {
         if (typeof windowProfile[key] !== "number") {
             return;
@@ -3850,6 +3939,20 @@ class BrowserCaptchaService:
     patchWindowMetric("outerWidth");
     patchWindowMetric("outerHeight");
     patchWindowMetric("devicePixelRatio");
+
+    const patchWindowPositionMetric = (key, defaultValue) => {
+        const value = (config.capability && config.capability[key] !== undefined) ? config.capability[key] : defaultValue;
+        defineGetter(window, key, () => value);
+        if (window.Window && window.Window.prototype) {
+            defineGetter(window.Window.prototype, key, () => value);
+        }
+    };
+    patchWindowPositionMetric("screenX", 0);
+    patchWindowPositionMetric("screenY", 0);
+    patchWindowPositionMetric("screenLeft", 0);
+    patchWindowPositionMetric("screenTop", 0);
+    patchWindowPositionMetric("mozInnerScreenX", 0);
+    patchWindowPositionMetric("mozInnerScreenY", 0);
 
     const ensureVisualViewportEnvironment = () => {
         const viewportProfile = windowProfile.visualViewport || {};
@@ -4843,6 +4946,196 @@ class BrowserCaptchaService:
             };
             setValue(window, "trustedTypes", trustedTypes);
         }
+        if (!navigator.bluetooth) {
+            const _btAvail = config.capability && config.capability.bluetoothAvailable === true;
+            const bluetooth = makeEventTargetLike({
+                getAvailability: async () => _btAvail,
+                requestDevice: async () => { throw new DOMException("User cancelled the request.", "NotFoundError"); },
+                requestLEScan: async () => { throw new DOMException("Bluetooth LE Scanning is not supported on this device.", "NotSupportedError"); },
+                onavailabilitychanged: null,
+                referringDevice: null,
+            });
+            defineGetter(Navigator.prototype, "bluetooth", () => bluetooth);
+            defineGetter(navigator, "bluetooth", () => bluetooth);
+        }
+        if (!navigator.usb) {
+            const _usbCount = (config.capability && config.capability.usbDeviceCount) || 0;
+            const usb = makeEventTargetLike({
+                getDevices: async () => Array.from({length: _usbCount}, (_, i) => ({
+                    vendorId: 7531 + i,
+                    productId: 9021 + i,
+                    deviceName: "USB Input Device",
+                    serialNumber: "",
+                })),
+                requestDevice: async () => { throw new DOMException("No device selected.", "NotFoundError"); },
+                onconnect: null,
+                ondisconnect: null,
+            });
+            defineGetter(Navigator.prototype, "usb", () => usb);
+            defineGetter(navigator, "usb", () => usb);
+        }
+        if (!navigator.serial) {
+            const _serialCount = (config.capability && config.capability.serialPortCount) || 0;
+            const serial = makeEventTargetLike({
+                getPorts: async () => Array.from({length: _serialCount}, (_, i) => ({
+                    readable: null,
+                    writable: null,
+                })),
+                requestPort: async () => { throw new DOMException("No port selected.", "NotFoundError"); },
+                onconnect: null,
+                ondisconnect: null,
+            });
+            defineGetter(Navigator.prototype, "serial", () => serial);
+            defineGetter(navigator, "serial", () => serial);
+        }
+        if (!navigator.hid) {
+            const _hidCount = (config.capability && config.capability.hidDeviceCount) || 0;
+            const hid = makeEventTargetLike({
+                getDevices: async () => Array.from({length: _hidCount}, (_, i) => ({
+                    opened: false,
+                    vendorId: 6702 + i,
+                    productId: 3310 + i,
+                    productName: "HID-compliant device",
+                    collections: [],
+                })),
+                requestDevice: async () => { throw new DOMException("No device selected.", "NotFoundError"); },
+                onconnect: null,
+                ondisconnect: null,
+            });
+            defineGetter(Navigator.prototype, "hid", () => hid);
+            defineGetter(navigator, "hid", () => hid);
+        }
+        if (!navigator.clipboard) {
+            const clipboard = {
+                read: async () => [],
+                readText: async () => "",
+                write: async () => undefined,
+                writeText: async () => undefined,
+            };
+            defineGetter(Navigator.prototype, "clipboard", () => clipboard);
+            defineGetter(navigator, "clipboard", () => clipboard);
+        }
+        if (!navigator.mediaCapabilities) {
+            const _mediaSmooth = (config.capability && config.capability.mediaCodecSmooth) !== false;
+            const mediaCapabilities = {
+                decodingInfo: async (configuration) => ({
+                    supported: true,
+                    smooth: _mediaSmooth,
+                    powerEfficient: _mediaSmooth,
+                    keySystemAccess: null,
+                }),
+                encodingInfo: async (configuration) => ({
+                    supported: true,
+                    smooth: _mediaSmooth,
+                    powerEfficient: _mediaSmooth,
+                }),
+            };
+            defineGetter(Navigator.prototype, "mediaCapabilities", () => mediaCapabilities);
+            defineGetter(navigator, "mediaCapabilities", () => mediaCapabilities);
+        }
+        if (!navigator.serviceWorker) {
+            const swRegistration = makeEventTargetLike({
+                installing: null,
+                waiting: null,
+                active: null,
+                scope: "",
+                updateViaCache: "imports",
+                onupdatefound: null,
+                update: async () => undefined,
+                unregister: async () => true,
+            });
+            const serviceWorkerContainer = makeEventTargetLike({
+                controller: null,
+                ready: Promise.resolve(swRegistration),
+                installing: null,
+                waiting: null,
+                active: null,
+                getRegistration: async () => undefined,
+                getRegistrations: async () => [],
+                register: async () => swRegistration,
+                startMessages: () => undefined,
+                oncontrollerchange: null,
+                onmessage: null,
+                onerror: null,
+            });
+            defineGetter(Navigator.prototype, "serviceWorker", () => serviceWorkerContainer);
+            defineGetter(navigator, "serviceWorker", () => serviceWorkerContainer);
+        }
+        if (!navigator.mediaSession) {
+            const mediaSession = {
+                metadata: null,
+                playbackState: "none",
+                setActionHandler: () => undefined,
+                setPositionState: () => undefined,
+                setMicrophoneActive: () => undefined,
+                setCameraActive: () => undefined,
+                onloadeddata: null,
+                onplay: null,
+                onpause: null,
+                onseeked: null,
+                onended: null,
+            };
+            defineGetter(Navigator.prototype, "mediaSession", () => mediaSession);
+            defineGetter(navigator, "mediaSession", () => mediaSession);
+        }
+        if (!navigator.wakeLock) {
+            const wakeLockSentinel = makeEventTargetLike({
+                type: "screen",
+                released: false,
+                release: async () => { wakeLockSentinel.released = true; },
+                onrelease: null,
+            });
+            const wakeLock = {
+                request: async (type) => wakeLockSentinel,
+            };
+            defineGetter(Navigator.prototype, "wakeLock", () => wakeLock);
+            defineGetter(navigator, "wakeLock", () => wakeLock);
+        }
+        if (!navigator.presentation) {
+            const presentation = {
+                defaultRequest: null,
+                receiver: null,
+                start: async () => makeEventTargetLike({
+                    id: "",
+                    url: "",
+                    state: "connected",
+                    onstatechange: null,
+                    onconnect: null,
+                    onclose: null,
+                    terminate: () => undefined,
+                }),
+                reconnect: async () => null,
+                getAvailability: async () => makeEventTargetLike({ value: false, onchange: null }),
+            };
+            defineGetter(Navigator.prototype, "presentation", () => presentation);
+            defineGetter(navigator, "presentation", () => presentation);
+        }
+        if (!window.openDatabase) {
+            setValue(window, "openDatabase", (name, version, displayName, estimatedSize, creationCallback) => ({
+                version: String(version || "1.0"),
+                changeVersion: (oldVersion, newVersion, callback) => {},
+                transaction: (callback) => {},
+                readTransaction: (callback) => {},
+            }));
+        }
+        if (!window.speechSynthesis) {
+            const _voiceCount = (config.capability && config.capability.speechVoiceCount) || 2;
+            const speechSynthesis = makeEventTargetLike({
+                pending: false,
+                speaking: false,
+                paused: false,
+                speak: () => undefined,
+                cancel: () => undefined,
+                pause: () => undefined,
+                resume: () => undefined,
+                getVoices: () => [
+                    {name: "Microsoft David", lang: "en-US", default: true},
+                    {name: "Microsoft Zira", lang: "en-US", default: false},
+                ].slice(0, _voiceCount),
+                onvoiceschanged: null,
+            });
+            setValue(window, "speechSynthesis", speechSynthesis);
+        }
     };
     ensureCapabilityEnvironment();
 
@@ -4932,6 +5225,21 @@ class BrowserCaptchaService:
             }
             setValue(window, "IdleDetector", PersonalIdleDetector);
         }
+        try {
+            if (typeof window.focus === "function") {
+                window.focus();
+            }
+        } catch (e) {}
+        const _emitPageEvent = (target, type) => {
+            try {
+                target.dispatchEvent(new Event(type));
+            } catch (e) {}
+        };
+        setTimeout(() => {
+            _emitPageEvent(document, "visibilitychange");
+            _emitPageEvent(window, "focus");
+            _emitPageEvent(window, "pageshow");
+        }, 0);
     };
     ensureBehaviorEnvironment();
 
@@ -4954,7 +5262,7 @@ class BrowserCaptchaService:
 
     const sanitizeStackText = (value) => String(value || "")
         .split("\\n")
-        .filter((line) => !/personalFingerprint|HeadlessVisible|evaluate_on_new_document|nodriver|cdp|__puppeteer|debugger eval/i.test(line))
+        .filter((line) => !/personalFingerprint|HeadlessVisible|evaluate_on_new_document|nodriver|cdp|__puppeteer|debugger eval|__personalAudioSpoof_/i.test(line))
         .join("\\n");
     if (window.Error && typeof Error.captureStackTrace === "function") {
         const originalCaptureStackTrace = Error.captureStackTrace;
@@ -4968,6 +5276,28 @@ class BrowserCaptchaService:
             return result;
         });
     }
+    try {
+        const originalStackDesc = Object.getOwnPropertyDescriptor(Error.prototype, "stack");
+        if (originalStackDesc && typeof originalStackDesc.get === "function") {
+            const originalStackGetter = originalStackDesc.get;
+            Object.defineProperty(Error.prototype, "stack", {
+                configurable: true,
+                enumerable: false,
+                get() {
+                    const rawStack = originalStackGetter.call(this);
+                    return sanitizeStackText(rawStack);
+                },
+                set(v) {
+                    Object.defineProperty(this, "stack", {
+                        configurable: true,
+                        enumerable: false,
+                        writable: true,
+                        value: v,
+                    });
+                },
+            });
+        }
+    } catch (e) {}
 
     if (window.AudioBuffer && AudioBuffer.prototype && typeof AudioBuffer.prototype.getChannelData === "function") {
         const originalGetChannelData = AudioBuffer.prototype.getChannelData;
@@ -5581,7 +5911,7 @@ class BrowserCaptchaService:
         for new_window in attempts:
             try:
                 target_id = await self._run_with_timeout(
-                    browser.connection.send(
+                    browser.send(
                         cdp.target.create_target(
                             initial_url,
                             new_window=new_window,
@@ -5774,7 +6104,7 @@ class BrowserCaptchaService:
                 )
 
         browser_context_id = await self._run_with_timeout(
-            browser.connection.send(
+            browser.send(
                 cdp.target.create_browser_context(
                     dispose_on_detach=True,
                 )
@@ -5787,7 +6117,7 @@ class BrowserCaptchaService:
         try:
             async def _send_create_target():
                 return await self._run_with_timeout(
-                    browser.connection.send(
+                    browser.send(
                         cdp.target.create_target(
                             initial_url,
                             browser_context_id=browser_context_id,
@@ -5874,7 +6204,7 @@ class BrowserCaptchaService:
                 from nodriver import cdp
 
                 return await self._run_with_timeout(
-                    self.browser.connection.send(
+                    self.browser.send(
                         cdp.storage.get_cookies(browser_context_id=browser_context_id)
                     ),
                     timeout_seconds or self._command_timeout_seconds,
@@ -5898,7 +6228,7 @@ class BrowserCaptchaService:
         timeout_seconds: Optional[float] = None,
     ):
         return await self._run_with_timeout(
-            self.browser.connection.send(command),
+            self.browser.send(command),
             timeout_seconds or self._command_timeout_seconds,
             label or "browser.command",
         )
@@ -6414,7 +6744,7 @@ class BrowserCaptchaService:
             from nodriver import cdp
 
             await self._run_with_timeout(
-                target_browser.connection.send(
+                target_browser.send(
                     cdp.target.dispose_browser_context(browser_context_id)
                 ),
                 timeout_seconds=5.0,
@@ -6508,7 +6838,7 @@ class BrowserCaptchaService:
             )
 
         await self._run_with_timeout(
-            self.browser.connection.send(cookie_command),
+            self.browser.send(cookie_command),
             timeout_seconds=timeout_seconds,
             label=label,
         )
@@ -7045,7 +7375,7 @@ class BrowserCaptchaService:
                     else:
                         clear_cookie_command = cdp.storage.clear_cookies(browser_context_id=browser_context_id)
                     await self._run_with_timeout(
-                        self.browser.connection.send(
+                        self.browser.send(
                             clear_cookie_command
                         ),
                         timeout_seconds=8.0,
@@ -9007,6 +9337,9 @@ class BrowserCaptchaService:
                                 label=launch_label,
                             )
                             self._browser_process_pid = self._get_browser_process_pid(self.browser)
+                            # uc.start() 成功后 CDP 连接已就绪（start() 内部已执行 update_targets 和 websocket 握手）
+                            # 短暂等待确保事件循环有机会处理已注册的回调
+                            await asyncio.sleep(0.1)
                             break
                         except Exception as start_error:
                             last_start_error = start_error
@@ -10256,6 +10589,100 @@ class BrowserCaptchaService:
             self._last_fingerprint = None
             self._last_fingerprint_at = 0.0
 
+    async def _cache_session_cookies_for_computed(self, resident_info):
+        """提取 Google session cookies 供 reload 链路复用。"""
+        if not resident_info or not resident_info.tab:
+            return
+        if get_cached_session_cookies() is not None:
+            return
+        from nodriver import cdp
+
+        tab = resident_info.tab
+        collected: Dict[str, str] = {}
+        _cookie_keywords = {"SID", "SSID", "APISID", "SAPISID", "HSID", "NID", "ENID"}
+
+        bcid = getattr(getattr(tab, "target", None), "browser_context_id", None)
+        for method, kwargs in (
+            (cdp.storage.get_cookies, {}),
+            (cdp.storage.get_cookies, {"browser_context_id": bcid}),
+            (cdp.network.get_all_cookies, {}),
+            (cdp.network.get_cookies, {"urls": ["https://www.google.com", "https://www.recaptcha.net", "https://accounts.google.com"]}),
+        ):
+            try:
+                effective_kwargs = {k: v for k, v in kwargs.items() if v is not None}
+                raw = await tab.send(method(**effective_kwargs))
+                if raw:
+                    for cookie in raw:
+                        cname = str(getattr(cookie, "name", "") or "").strip()
+                        cvalue = str(getattr(cookie, "value", "") or "").strip()
+                        cdomain = str(getattr(cookie, "domain", "") or "").strip().lower()
+                        if not cname or not cvalue or not cdomain.lstrip(".").endswith(("google.com", "recaptcha.net")):
+                            continue
+                        if any(k in cname for k in _cookie_keywords):
+                            collected[cname] = cvalue
+                    if collected:
+                        set_cached_session_cookies(collected)
+                        return
+            except Exception:
+                continue
+
+        done_event = asyncio.get_running_loop().create_future()
+
+        async def _on_extra(event):
+            try:
+                for ac in (getattr(event, "associated_cookies", None) or []):
+                    cookie = getattr(ac, "cookie", None)
+                    if not cookie:
+                        continue
+                    cname = str(getattr(cookie, "name", "") or "").strip()
+                    cvalue = str(getattr(cookie, "value", "") or "").strip()
+                    cdomain = str(getattr(cookie, "domain", "") or "").strip().lower()
+                    if not cname or not cvalue or not cdomain.lstrip(".").endswith(("google.com", "recaptcha.net")):
+                        continue
+                    if any(k in cname for k in _cookie_keywords):
+                        collected[cname] = cvalue
+                if collected and not done_event.done():
+                    done_event.set_result(True)
+            except Exception:
+                pass
+
+        current_url = None
+        try:
+            r = await tab.send(cdp.runtime.evaluate(
+                expression="document.location.href", await_promise=False,
+            ))
+            v = getattr(r, "result", None)
+            if v and hasattr(v, "value"):
+                current_url = str(v.value or "")
+        except Exception:
+            pass
+
+        tab.add_handler(cdp.network.RequestWillBeSentExtraInfo, _on_extra)
+        try:
+            await tab.send(cdp.page.navigate(url="https://www.google.com/"))
+            await asyncio.wait_for(asyncio.shield(done_event), timeout=6.0)
+        except asyncio.TimeoutError:
+            pass
+        except Exception:
+            pass
+        finally:
+            try:
+                tab.remove_handler(cdp.network.RequestWillBeSentExtraInfo, _on_extra)
+            except Exception:
+                pass
+            if not done_event.done():
+                done_event.set_result(False)
+
+        if current_url:
+            try:
+                await tab.send(cdp.page.navigate(url=current_url))
+                await asyncio.sleep(1.0)
+            except Exception:
+                pass
+
+        if collected:
+            set_cached_session_cookies(collected)
+
     async def _solve_with_resident_tab(
         self,
         slot_id: str,
@@ -10299,6 +10726,11 @@ class BrowserCaptchaService:
             self._remember_fingerprint(resident_info.fingerprint)
         else:
             resident_info.fingerprint = await self._refresh_last_fingerprint(resident_info.tab)
+        # 同步提取 session cookie 供 reload 链路复用
+        try:
+            await self._cache_session_cookies_for_computed(resident_info)
+        except Exception:
+            pass
         debug_logger.log_info(
             "[BrowserCaptcha] ✅ Token生成成功"
             f"（slot={slot_id}, 耗时 {duration_ms:.0f}ms, "

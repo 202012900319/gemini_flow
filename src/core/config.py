@@ -3,7 +3,7 @@ import tomli
 from pathlib import Path
 from typing import Dict, Any, Optional
 
-DEFAULT_YESCAPTCHA_TASK_TYPE = "RecaptchaV3TaskProxylessM1"
+DEFAULT_YESCAPTCHA_TASK_TYPE = "RecaptchaV3TaskProxylessM1S7"
 YESCAPTCHA_TASK_TYPE_OPTIONS = {
     "RecaptchaV3TaskProxyless": None,
     "RecaptchaV3TaskProxylessM1": None,
@@ -436,6 +436,24 @@ class Config:
             return max(60, int(value))
         except Exception:
             return 600
+
+    @property
+    def browser_captcha_max_retries(self) -> int:
+        """browser 模式单次打码最大重试次数。"""
+        value = self._config.get("captcha", {}).get("browser_captcha_max_retries", 5)
+        try:
+            return max(1, min(20, int(value)))
+        except Exception:
+            return 5
+
+    @property
+    def browser_captcha_generation_retries(self) -> int:
+        """生成接口因 reCAPTCHA 评估失败时允许的总重试次数。"""
+        value = self._config.get("captcha", {}).get("browser_captcha_generation_retries", 6)
+        try:
+            return max(1, min(20, int(value)))
+        except Exception:
+            return 6
 
     @property
     def personal_max_resident_tabs(self) -> int:

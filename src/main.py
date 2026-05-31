@@ -1,4 +1,9 @@
 """FastAPI application initialization"""
+import asyncio
+import os
+import sys
+import warnings
+
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -16,6 +21,67 @@ from .services.load_balancer import LoadBalancer
 from .services.concurrency_manager import ConcurrencyManager
 from .services.generation_handler import GenerationHandler
 from .api import routes, admin
+
+
+_LOCAL_NO_PROXY_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def _configure_stdio_utf8() -> None:
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+def _configure_local_no_proxy() -> None:
+    for env_name in ("NO_PROXY", "no_proxy"):
+        raw_value = str(os.environ.get(env_name, "") or "")
+        entries = [item.strip() for item in raw_value.replace(";", ",").split(",") if item.strip()]
+        normalized = {item.lower() for item in entries}
+        changed = False
+        for host in _LOCAL_NO_PROXY_HOSTS:
+            if host.lower() not in normalized:
+                entries.append(host)
+                normalized.add(host.lower())
+                changed = True
+        if changed or not raw_value:
+            os.environ[env_name] = ",".join(entries)
+
+
+def _configure_asyncio_policy() -> None:
+    if os.name != "nt":
+        return
+    policy_cls = getattr(asyncio, "WindowsProactorEventLoopPolicy", None)
+    if policy_cls is None:
+        return
+    try:
+        if not isinstance(asyncio.get_event_loop_policy(), policy_cls):
+            asyncio.set_event_loop_policy(policy_cls())
+    except Exception:
+        pass
+
+
+def _suppress_known_runtime_warnings() -> None:
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*Proactor event loop does not implement add_reader family of methods required.*",
+        category=RuntimeWarning,
+    )
+
+
+def _configure_process_runtime() -> None:
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    _configure_stdio_utf8()
+    _configure_local_no_proxy()
+    _configure_asyncio_policy()
+    _suppress_known_runtime_warnings()
+
+
+_configure_process_runtime()
 
 
 @asynccontextmanager
@@ -37,13 +103,13 @@ async def lifespan(app: FastAPI):
 
     # Handle database initialization based on startup type
     if is_first_startup:
-        print("🎉 First startup detected. Initializing database and configuration from setting.toml...")
+        print("First startup detected. Initializing database and configuration from setting.toml...")
         await db.init_config_from_toml(config_dict, is_first_startup=True)
-        print("✓ Database and configuration initialized successfully.")
+        print("Database and configuration initialized successfully.")
     else:
-        print("🔄 Existing database detected. Checking for missing tables and columns...")
+        print("Existing database detected. Checking for missing tables and columns...")
         await db.check_and_migrate_db(config_dict)
-        print("✓ Database migration check completed.")
+        print("Database migration check completed.")
 
     # 启动时统一把数据库配置同步到内存，避免 personal/brower 相关运行时配置遗漏。
     await db.reload_config_to_memory()
@@ -64,7 +130,7 @@ async def lifespan(app: FastAPI):
             resolve_effective_personal_max_resident_tabs,
         )
         browser_service = await BrowserCaptchaService.get_instance(db)
-        print("✓ Browser captcha service initialized (nodriver mode)")
+        print("Browser captcha service initialized (nodriver mode)")
 
         warmup_limit = max(1, min(
             PERSONAL_POOL_MAX_TOTAL_RESIDENT_TABS,
@@ -86,27 +152,27 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             warmup_error = e
             print(
-                "⚠ Browser captcha resident warmup failed: "
+                "Browser captcha resident warmup failed: "
                 f"{type(e).__name__}: {e}"
             )
         if warmed_slots:
             print(
-                f"✓ Browser captcha shared resident tabs warmed "
+                f"Browser captcha shared resident tabs warmed "
                 f"({len(warmed_slots)} slot(s), limit={warmup_limit})"
             )
         elif warmup_error is not None:
-            print("⚠ Browser captcha resident warmup skipped for this startup")
+            print("Browser captcha resident warmup skipped for this startup")
         elif tokens:
-            print("⚠ Browser captcha resident warmup skipped: no tab warmed successfully")
+            print("Browser captcha resident warmup skipped: no tab warmed successfully")
         else:
             # 没有任何可用 token 时，打开登录窗口供用户手动操作
             await browser_service.open_login_window()
-            print("⚠ No active token found, opened login window for manual setup")
+            print("No active token found, opened login window for manual setup")
     elif captcha_config.captcha_method == "browser":
         from .services.browser_captcha import BrowserCaptchaService
         browser_service = await BrowserCaptchaService.get_instance(db)
         await browser_service.warmup_browser_slots()
-        print("? Browser captcha service initialized (headed mode)")
+        print("Browser captcha service initialized (headed mode)")
 
     # Initialize concurrency manager
     await concurrency_manager.initialize(tokens)
@@ -114,9 +180,9 @@ async def lifespan(app: FastAPI):
     if config.captcha_method == "remote_browser":
         try:
             warmed_projects = await flow_client.prefill_remote_browser_for_tokens(tokens, action="IMAGE_GENERATION")
-            print(f"✓ Remote browser pool prefill started for {warmed_projects} project(s)")
+            print(f"Remote browser pool prefill started for {warmed_projects} project(s)")
         except Exception as e:
-            print(f"⚠ Remote browser pool prefill failed: {e}")
+            print(f"Remote browser pool prefill failed: {e}")
 
     # Start 429 auto-unban task
     import asyncio
@@ -127,19 +193,21 @@ async def lifespan(app: FastAPI):
                 await asyncio.sleep(3600)  # 每小时执行一次
                 await token_manager.auto_unban_429_tokens()
             except Exception as e:
-                print(f"❌ Auto-unban task error: {e}")
+                print(f"Auto-unban task error: {e}")
 
     auto_unban_task_handle = asyncio.create_task(auto_unban_task())
+    token_manager.start_protocol_refresher()
 
-    print(f"✓ Database initialized")
-    print(f"✓ Total tokens: {len(tokens)}")
-    print(f"✓ Cache: {'Enabled' if config.cache_enabled else 'Disabled'} (timeout: {config.cache_timeout}s)")
+    print("Database initialized")
+    print(f"Total tokens: {len(tokens)}")
+    print(f"Cache: {'Enabled' if config.cache_enabled else 'Disabled'} (timeout: {config.cache_timeout}s)")
     if cache_cleanup_enabled:
-        print("✓ File cache cleanup task started")
+        print("File cache cleanup task started")
     else:
-        print("✓ File cache cleanup task disabled (timeout <= 0)")
-    print(f"✓ 429 auto-unban task started (runs every hour)")
-    print(f"✓ Server running on http://{config.server_host}:{config.server_port}")
+        print("File cache cleanup task disabled (timeout <= 0)")
+    print("429 auto-unban task started (runs every hour)")
+    print("Protocol token refresher started (runs every minute)")
+    print(f"Server running on http://{config.server_host}:{config.server_port}")
     print("=" * 60)
 
     yield
@@ -154,12 +222,14 @@ async def lifespan(app: FastAPI):
         await auto_unban_task_handle
     except asyncio.CancelledError:
         pass
+    await token_manager.stop_protocol_refresher()
     # Close browser if initialized
     if browser_service:
         await browser_service.close()
-        print("✓ Browser captcha service closed")
-    print("✓ File cache cleanup task stopped")
-    print("✓ 429 auto-unban task stopped")
+        print("Browser captcha service closed")
+    print("File cache cleanup task stopped")
+    print("429 auto-unban task stopped")
+    print("Protocol token refresher stopped")
 
 
 # Initialize components
