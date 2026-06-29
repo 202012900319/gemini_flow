@@ -65,6 +65,17 @@ class FlowClient:
         # 发车策略改为“请求到就发”：
         # 不在 flow2api 本地对提交做批次整形或排队，避免把同批请求打成阶梯。
 
+    def _ensure_runtime_state(self) -> None:
+        if not hasattr(self, "_user_agent_cache"):
+            self._user_agent_cache = {}
+        if not hasattr(self, "_request_fingerprint_ctx"):
+            self._request_fingerprint_ctx = contextvars.ContextVar(
+                "flow_request_fingerprint",
+                default=None
+            )
+        if not hasattr(self, "_remote_browser_prefill_last_sent"):
+            self._remote_browser_prefill_last_sent = {}
+
     def _generate_user_agent(self, account_id: str = None) -> str:
         """基于账号ID生成固定的 User-Agent
         
@@ -75,6 +86,7 @@ class FlowClient:
             User-Agent 字符串
         """
         # 如果没有提供账号ID，生成随机UA
+        self._ensure_runtime_state()
         if not account_id:
             account_id = f"random_{random.randint(1, 999999)}"
         
@@ -102,10 +114,12 @@ class FlowClient:
 
     def _set_request_fingerprint(self, fingerprint: Optional[Dict[str, Any]]):
         """设置当前请求链路的浏览器指纹上下文。"""
+        self._ensure_runtime_state()
         self._request_fingerprint_ctx.set(dict(fingerprint) if fingerprint else None)
 
     def get_request_fingerprint(self) -> Optional[Dict[str, Any]]:
         """获取当前请求链路绑定的浏览器指纹快照。"""
+        self._ensure_runtime_state()
         fingerprint = self._request_fingerprint_ctx.get()
         if not isinstance(fingerprint, dict) or not fingerprint:
             return None
@@ -1970,6 +1984,8 @@ class FlowClient:
         embedded_url = self._extract_video_url_from_media(media)
         if embedded_url:
             video_metadata["embeddedUrl"] = embedded_url
+            if not video_metadata.get("fifeUrl"):
+                video_metadata["fifeUrl"] = embedded_url
 
         return video_metadata
 
