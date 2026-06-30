@@ -76,3 +76,6 @@ tests/__pycache__/
 
 # Local research scratch files
 .firecrawl*
+
+# Local third-party service checkouts
+third_party/
