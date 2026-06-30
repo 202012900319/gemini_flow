@@ -5,14 +5,26 @@
 - Docker Desktop is running.
 - `config/setting.toml` exists. If missing, copy it from `config/setting_example.toml`.
 - `flow_captcha_service` is deployed under `third_party/flow_captcha_service` and started in `standalone` mode.
-- Local source deployment is started with:
+- Preferred unified local stack deployment is started with:
+
+```powershell
+.\scripts\start-local-stack.ps1
+```
+
+This starts `flow2api` and `flow_captcha_service` in the same Docker Compose project and configures Flow2API to use:
+
+```text
+http://flow-captcha-service:8060
+```
+
+- Standalone Flow2API-only deployment remains available for debugging:
 
 ```powershell
 docker compose -f docker-compose.local.yml up -d --build
 ```
 
 - Captcha mode is set to `remote_browser` in the running Flow2API configuration.
-- `remote_browser_base_url` points to `http://host.docker.internal:8060` from the Flow2API container.
+- In the unified stack, `remote_browser_base_url` points to `http://flow-captcha-service:8060` from the Flow2API container.
 - `remote_browser_api_key` matches a service API key created in `flow_captcha_service`.
 - A valid Flow/ST token has been added through the Flow2API Token Updater extension or admin UI.
 
@@ -23,7 +35,7 @@ Runtime note: Flow2API loads admin/API settings from `data/flow.db` after startu
 1. Flow2API container is running:
 
 ```powershell
-docker compose -f docker-compose.local.yml ps
+docker compose -p gemini-flow-stack -f docker-compose.stack.yml ps
 ```
 
 Expected: `flow2api` is `Up` and publishes `38000->8000`.
@@ -36,10 +48,18 @@ docker ps --filter "name=flow-captcha-service"
 
 Expected: `flow-captcha-service` is `Up` and publishes `8060->8060`.
 
-3. Startup logs are clean:
+3. Flow2API can reach the captcha service by Docker service name:
 
 ```powershell
-docker compose -f docker-compose.local.yml logs --tail=120 flow2api
+docker exec flow2api python -c "import urllib.request; print(urllib.request.urlopen('http://flow-captcha-service:8060/api/v1/health', timeout=10).read().decode())"
+```
+
+Expected: `success: true`.
+
+4. Startup logs are clean:
+
+```powershell
+docker compose -p gemini-flow-stack -f docker-compose.stack.yml logs --tail=120 flow2api
 docker logs --tail 120 flow-captcha-service
 ```
 
@@ -61,7 +81,9 @@ docker run --rm -v "${PWD}:/workspace" -w /workspace flow2api-local-verify sh -l
 
 Expected: all tests pass.
 
-Current result on 2026-06-29: `40 passed`.
+Current result on 2026-06-30: `40 passed`.
+
+`pytest.ini` limits default collection to Flow2API's own `tests/` directory so the ignored `third_party/flow_captcha_service` checkout is not collected.
 
 ## HTTP Smoke Tests
 
@@ -109,6 +131,7 @@ Expected: `captcha_method` is `remote_browser` and `remote_browser_configured` i
 
 ```powershell
 curl.exe -fsS http://127.0.0.1:8060/api/v1/health
+docker exec flow2api python -c "import urllib.request; print(urllib.request.urlopen('http://flow-captcha-service:8060/api/v1/health', timeout=10).read().decode())"
 ```
 
 Expected: `success: true`.

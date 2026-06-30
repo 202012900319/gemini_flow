@@ -27,6 +27,16 @@ Flow2API is a FastAPI service that exposes OpenAI-compatible and Gemini-compatib
 
 ## Local Deployment
 
+Preferred one-command local stack for Flow2API plus headed remote captcha service:
+
+```powershell
+.\scripts\start-local-stack.ps1
+```
+
+This uses `docker-compose.stack.yml` with Compose project `gemini-flow-stack`, starts `flow2api` and `flow-captcha-service` on the same default Docker network, and sets Flow2API's remote browser URL to `http://flow-captcha-service:8060`. The launcher preserves the existing `remote_browser_api_key` in `data/flow.db`.
+
+Keep `config/setting.toml` encoded as UTF-8. The launcher reads and writes it explicitly as UTF-8 because Python `tomli` fails startup on non-UTF-8 TOML files.
+
 Use the local-source compose file so the running container matches the checkout:
 
 ```powershell
@@ -52,4 +62,15 @@ Run source tests with the current checkout mounted into that image:
 docker run --rm -v "${PWD}:/workspace" -w /workspace flow2api-local-verify sh -lc "python -m pip install pytest -q && python -m pytest -q"
 ```
 
+`pytest.ini` intentionally limits collection to `tests/`; `third_party/flow_captcha_service` is an ignored external checkout and should not be collected as part of Flow2API tests.
+
 Smoke check the running service with `/health`, `/metrics`, `/v1/models`, and `/api/login`.
+
+For unified stack checks:
+
+```powershell
+docker compose -p gemini-flow-stack -f docker-compose.stack.yml ps
+curl.exe -fsS http://127.0.0.1:8060/api/v1/health
+curl.exe -fsS http://127.0.0.1:38000/health
+docker exec flow2api python -c "import urllib.request; print(urllib.request.urlopen('http://flow-captcha-service:8060/api/v1/health', timeout=10).read().decode())"
+```
