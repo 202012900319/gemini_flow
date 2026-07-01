@@ -6,6 +6,7 @@ Local deployment and acceptance verification of `TheSmallHanCat/flow2api`.
 
 ## Latest Meaningful Changes
 
+- Added an optional Pic Batch Studio Docker Compose override. It keeps Pic Batch as a separate container in the same `gemini-flow-stack` project and persists its SQLite/image state under `data/pic-batch/`.
 - Created local runtime config from `config/setting_example.toml`.
 - Deployed the service with `docker-compose.local.yml` using a local-source image.
 - Deployed `genz27/flow_captcha_service` locally in standalone headed-browser mode at `http://127.0.0.1:8060`.
@@ -23,12 +24,16 @@ Working locally at `http://localhost:38000`.
 
 Flow2API and `flow_captcha_service` can be started together with `.\scripts\start-local-stack.ps1`. The unified stack uses Docker service discovery, so Flow2API reaches the captcha service at `http://flow-captcha-service:8060`.
 
+Pic Batch can be added to the same stack with `docker-compose.pic-batch.yml`. It exposes Studio at `http://localhost:39000`, stores runtime data in `data/pic-batch/`, and should configure its Flow2API provider as `http://flow2api:8000`.
+
 Flow2API is running with one configured token. `flow_captcha_service` is healthy in standalone mode and Flow2API reports `captcha_method: remote_browser`, `remote_browser_configured: true`.
 
 Admin login uses the default local credentials `admin` / `admin`; this should be changed before any non-local exposure. The runtime API key is currently database-backed and may differ from `config/setting.toml` if changed through the admin UI.
 
 ## Verification Status
 
+- Pic Batch override compose config passed with `docker compose -p gemini-flow-stack -f docker-compose.stack.yml -f docker-compose.pic-batch.yml config`.
+- Pic Batch container build/health smoke is blocked by Docker/registry metadata retrieval for the base image `node:22-bookworm-slim`; retry after Docker Hub access/cache recovers.
 - Docker local-source build: passed.
 - Full mounted source tests in Docker dependency environment: `40 passed`. `pytest.ini` limits collection to Flow2API's own `tests/` so the ignored `third_party/flow_captcha_service` checkout is not collected.
 - Flow2API health endpoint: passed, `backend_running: true`, `captcha_method: remote_browser`, `remote_browser_configured: true`.
@@ -62,6 +67,8 @@ docker compose -f docker-compose.local.yml down
 docker compose -f docker-compose.local.yml up -d --build
 .\scripts\start-local-stack.ps1
 docker compose -p gemini-flow-stack -f docker-compose.stack.yml ps
+docker compose -p gemini-flow-stack -f docker-compose.stack.yml -f docker-compose.pic-batch.yml config
 curl.exe -fsS http://127.0.0.1:38000/health
 curl.exe -fsS http://127.0.0.1:8060/api/v1/health
+curl.exe -fsS http://127.0.0.1:39000/api/health
 ```

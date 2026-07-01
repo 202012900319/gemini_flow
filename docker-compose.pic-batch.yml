@@ -1,0 +1,37 @@
+services:
+  flow2api:
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).read()\""]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  pic-batch:
+    build:
+      context: ../pic_batch_dev
+      dockerfile: Dockerfile
+    image: pic-batch:local
+    container_name: pic-batch
+    env_file:
+      - ./config/pic-batch.env
+    environment:
+      NODE_ENV: production
+      PIC_BATCH_DATA_DIR: data
+      PIC_BATCH_STORAGE_DIR: storage
+      PIC_BATCH_USE_MOCK: "false"
+    ports:
+      - "39000:3000"
+    volumes:
+      - ./data/pic-batch/data:/app/data
+      - ./data/pic-batch/storage:/app/storage
+    depends_on:
+      flow2api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/api/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped

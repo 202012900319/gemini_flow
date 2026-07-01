@@ -45,6 +45,7 @@ logs.txt
 # Environment
 .env
 .env.local
+config/pic-batch.env
 
 # Config (optional)
 # config/setting.toml

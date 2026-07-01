@@ -35,6 +35,14 @@ Preferred one-command local stack for Flow2API plus headed remote captcha servic
 
 This uses `docker-compose.stack.yml` with Compose project `gemini-flow-stack`, starts `flow2api` and `flow-captcha-service` on the same default Docker network, and sets Flow2API's remote browser URL to `http://flow-captcha-service:8060`. The launcher preserves the existing `remote_browser_api_key` in `data/flow.db`.
 
+Optional Pic Batch Studio deployment uses an override file:
+
+```powershell
+docker compose -p gemini-flow-stack -f docker-compose.stack.yml -f docker-compose.pic-batch.yml up -d --build
+```
+
+This adds a separate `pic-batch` service at `http://localhost:39000`, with persistent runtime data under `data/pic-batch/`. The Pic Batch provider Base URL must use Docker service discovery: `http://flow2api:8000`.
+
 Keep `config/setting.toml` encoded as UTF-8. The launcher reads and writes it explicitly as UTF-8 because Python `tomli` fails startup on non-UTF-8 TOML files.
 
 Use the local-source compose file so the running container matches the checkout:
@@ -70,7 +78,9 @@ For unified stack checks:
 
 ```powershell
 docker compose -p gemini-flow-stack -f docker-compose.stack.yml ps
+docker compose -p gemini-flow-stack -f docker-compose.stack.yml -f docker-compose.pic-batch.yml config
 curl.exe -fsS http://127.0.0.1:8060/api/v1/health
 curl.exe -fsS http://127.0.0.1:38000/health
+curl.exe -fsS http://127.0.0.1:39000/api/health
 docker exec flow2api python -c "import urllib.request; print(urllib.request.urlopen('http://flow-captcha-service:8060/api/v1/health', timeout=10).read().decode())"
 ```
