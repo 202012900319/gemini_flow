@@ -33,7 +33,10 @@ Admin login uses the default local credentials `admin` / `admin`; this should be
 ## Verification Status
 
 - Pic Batch override compose config passed with `docker compose -p gemini-flow-stack -f docker-compose.stack.yml -f docker-compose.pic-batch.yml config`.
-- Pic Batch container build/health smoke is blocked by Docker/registry metadata retrieval for the base image `node:22-bookworm-slim`; retry after Docker Hub access/cache recovers.
+- Pic Batch container build passed after Docker recovered `node:22-bookworm-slim` metadata/cache.
+- Full stack health passed with `flow-captcha-service`, `flow2api`, and `pic-batch` healthy; Pic Batch responds at `http://127.0.0.1:39000/api/health` and `/studio/compose`.
+- Pic Batch can reach Flow2API by Docker service name at `http://flow2api:8000`; the active Studio provider is configured as `flow2api-gemini-image`, refreshed 35 model capabilities, and does not expose the exact runtime API key in settings responses.
+- Real image generation was not automatically run during Docker deployment verification to avoid consuming Flow account quota.
 - Docker local-source build: passed.
 - Full mounted source tests in Docker dependency environment: `40 passed`. `pytest.ini` limits collection to Flow2API's own `tests/` so the ignored `third_party/flow_captcha_service` checkout is not collected.
 - Flow2API health endpoint: passed, `backend_running: true`, `captcha_method: remote_browser`, `remote_browser_configured: true`.
