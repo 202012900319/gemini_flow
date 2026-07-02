@@ -1547,7 +1547,8 @@ class FlowClient:
                     raise RuntimeError(
                         "Project-scoped image upload failed via /flow/uploadImage; "
                         "legacy :uploadUserImage fallback is disabled because it may attach media "
-                        f"to a different project (project_id={normalized_project_id})."
+                        f"to a different project (project_id={normalized_project_id}). "
+                        f"Last upload error: {str(new_upload_error)[:500]}"
                     ) from new_upload_error
 
                 debug_logger.log_warning(

@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import AsyncMock
 
+from src.services.generation_handler import GenerationHandler
 from src.services.flow_client import FlowClient
 
 
@@ -81,7 +82,7 @@ class FlowClientUploadImageTests(unittest.IsolatedAsyncioTestCase):
 
         client._make_request = AsyncMock(side_effect=fake_make_request)
 
-        with self.assertRaisesRegex(RuntimeError, "legacy :uploadUserImage fallback is disabled"):
+        with self.assertRaisesRegex(RuntimeError, "Last upload error: HTTP 500: upstream failed"):
             await client.upload_image(
                 at="test-at",
                 image_bytes=JPEG_BYTES,
@@ -127,6 +128,25 @@ class FlowClientUploadImageTests(unittest.IsolatedAsyncioTestCase):
             "projectId",
             request_calls[1]["json_data"]["clientContext"],
         )
+
+    def test_project_scoped_transient_upload_failure_does_not_count_token_error(self):
+        handler = GenerationHandler.__new__(GenerationHandler)
+
+        transient_error = RuntimeError(
+            "Project-scoped image upload failed via /flow/uploadImage; "
+            "legacy :uploadUserImage fallback is disabled because it may attach media "
+            "to a different project (project_id=project-123). "
+            "Last upload error: Flow API request failed: HTTP Error 500: upstream failed"
+        )
+        auth_error = RuntimeError(
+            "Project-scoped image upload failed via /flow/uploadImage; "
+            "legacy :uploadUserImage fallback is disabled because it may attach media "
+            "to a different project (project_id=project-123). "
+            "Last upload error: Flow API request failed: HTTP Error 401: auth failed"
+        )
+
+        self.assertFalse(handler._should_count_token_error(transient_error))
+        self.assertTrue(handler._should_count_token_error(auth_error))
 
 
 if __name__ == "__main__":

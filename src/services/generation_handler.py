@@ -1503,6 +1503,19 @@ class GenerationHandler:
         if any(marker in error_text for marker in non_token_fault_markers):
             return False
 
+        if "project-scoped image upload failed via /flow/uploadimage" in error_text:
+            transient_upload_markers = (
+                "http error 500",
+                "http error 502",
+                "http error 503",
+                "http error 504",
+                "timed out",
+                "timeout",
+                "connection",
+            )
+            if any(marker in error_text for marker in transient_upload_markers):
+                return False
+
         if "没有可用的token进行" in error_text:
             return False
 

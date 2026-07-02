@@ -7,6 +7,7 @@ Local deployment and acceptance verification of `TheSmallHanCat/flow2api`.
 ## Latest Meaningful Changes
 
 - Added an optional Pic Batch Studio Docker Compose override. It keeps Pic Batch as a separate container in the same `gemini-flow-stack` project and persists its SQLite/image state under `data/pic-batch/`.
+- Improved project-scoped image upload failure handling so transient `/flow/uploadImage` 5xx/timeout failures expose the upstream cause and do not automatically disable the token.
 - Created local runtime config from `config/setting_example.toml`.
 - Deployed the service with `docker-compose.local.yml` using a local-source image.
 - Deployed `genz27/flow_captcha_service` locally in standalone headed-browser mode at `http://127.0.0.1:8060`.
@@ -38,7 +39,9 @@ Admin login uses the default local credentials `admin` / `admin`; this should be
 - Pic Batch can reach Flow2API by Docker service name at `http://flow2api:8000`; the active Studio provider is configured as `flow2api-gemini-image`, refreshed 35 model capabilities, and does not expose the exact runtime API key in settings responses.
 - Real image generation was not automatically run during Docker deployment verification to avoid consuming Flow account quota.
 - Docker local-source build: passed.
-- Full mounted source tests in Docker dependency environment: `40 passed`. `pytest.ini` limits collection to Flow2API's own `tests/` so the ignored `third_party/flow_captcha_service` checkout is not collected.
+- Full mounted source tests in Docker dependency environment: `41 passed`. `pytest.ini` limits collection to Flow2API's own `tests/` so the ignored `third_party/flow_captcha_service` checkout is not collected.
+- Upload failure diagnosis: current `/flow/uploadImage` uploads succeeded for a tiny PNG and three recent Pic Batch reference images against project `20558787-c8b5-4255-9b27-35cd133b779c`; the observed failure was transient/upstream, then repeated failures auto-disabled the only token.
+- Runtime token recovery: token 1 was re-enabled locally and consecutive error count reset after confirming AT/project-scoped upload still works.
 - Flow2API health endpoint: passed, `backend_running: true`, `captcha_method: remote_browser`, `remote_browser_configured: true`.
 - `flow_captcha_service` health endpoint: passed, `success: true`, `role: standalone`.
 - Unified Docker stack: passed with `.\scripts\start-local-stack.ps1`; both services run in project `gemini-flow-stack`, and `flow-captcha-service` is healthy.
